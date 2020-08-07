@@ -2499,6 +2499,11 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
         }
     }
 
+    // Check that the block satisfies synchronized checkpoint
+    if (!IsInitialBlockDownload() && !CheckSyncCheckpoint(nullptr, block.GetHash(), pindex->nHeight)) {
+        return state.DoS(100, error("%s: Block rejected by synchronized checkpoint", __func__), REJECT_CHECKPOINT, "bad-block-checkpoint-sync");
+    }
+
     int64_t nTime1 = GetTimeMicros(); nTimeCheck += nTime1 - nTimeStart;
     LogPrint("bench", "    - Sanity checks: %.2fms [%.2fs]\n", 0.001 * (nTime1 - nTimeStart), nTimeCheck * 0.000001);
 
@@ -3001,9 +3006,6 @@ void static UpdateTip(CBlockIndex *pindexNew, const CChainParams& chainParams) {
     if (!warningMessages.empty())
         LogPrintf(" warning='%s'", boost::algorithm::join(warningMessages, ", "));
     LogPrintf("\n");
-
-    if (!IsInitialBlockDownload() && chainActive.Tip()->pprev)
-        CheckSyncCheckpoint(chainActive.Tip()->GetBlockHash(), chainActive.Tip()->pprev);
 }
 
 /** Disconnect chainActive's tip. You probably want to call mempool.removeForReorg and manually re-limit mempool size after this, with cs_main held. */
@@ -3768,6 +3770,11 @@ bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationState& sta
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
         return state.DoS(100, false, REJECT_INVALID, "bad-diffbits", false, "incorrect proof of work");
 
+    // Check that the block satisfies synchronized checkpoint
+    if (!IsInitialBlockDownload() && !CheckSyncCheckpoint(nullptr, block.GetHash(), nHeight)) {
+        return state.DoS(100, error("%s: Block rejected by synchronized checkpoint", __func__), REJECT_CHECKPOINT, "bad-block-checkpoint-sync");
+    }
+
     // Check timestamp against prev
     if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())
         return state.Invalid(false, REJECT_INVALID, "time-too-old", "block's timestamp is too early");
@@ -3874,11 +3881,6 @@ bool ContextualCheckBlock(const CBlock& block, CValidationState& state, CBlockIn
     if (GetBlockWeight(block) > MAX_BLOCK_WEIGHT) {
         return state.DoS(100, error("ContextualCheckBlock(): weight limit failed"), REJECT_INVALID, "bad-blk-weight");
     }
-
-    // Check that the block satisfies synchronized checkpoint
-    if (!IsInitialBlockDownload() && !CheckSyncCheckpoint(block.GetHash(), pindexPrev))
-        return state.Invalid(error("%s : rejected by synchronized checkpoint", __func__),
-                             REJECT_OBSOLETE, "bad-version");
 
     return true;
 }
@@ -4029,18 +4031,10 @@ bool ProcessNewBlock(CValidationState& state, const CChainParams& chainparams, C
             return error("%s: AcceptBlock FAILED", __func__);
     }
 
-	// Ask for pending sync-checkpoint if any
-    if (!IsInitialBlockDownload())
-        AskForPendingSyncCheckpoint(pfrom);
-
     NotifyHeaderTip();
 
     if (!ActivateBestChain(state, chainparams, pblock))
         return error("%s: ActivateBestChain failed", __func__);
-	
-	// If responsible for sync-checkpoint send it
-    if (pfrom && !CSyncCheckpoint::strMasterPrivKey.empty() && (int)GetArg("-checkpointdepth", -1) >= 0)
-    	SendSyncCheckpoint(AutoSelectSyncCheckpoint());
 
     return true;
 }
@@ -4977,13 +4971,6 @@ std::string GetWarnings(const std::string& strFor)
 
     if (GetBoolArg("-testsafemode", DEFAULT_TESTSAFEMODE))
         strStatusBar = strRPC = strGUI = "testsafemode enabled";
-	
-    // Checkpoint warning
-    if (strCheckpointWarning != "")
-    {
-        strStatusBar = strCheckpointWarning;
-        strGUI += (strGUI.empty() ? "" : uiAlertSeperator) + strCheckpointWarning;
-    }
 
     // Misc warnings like out of disk space and clock is wrong
     if (strMiscWarning != "")
@@ -5369,6 +5356,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             State(pfrom->GetId())->fHaveWitness = true;
         }
 
+        if((pfrom->nServices & NODE_ACP))
+            pfrom->supportACPMessages = true;
+
         // Potentially mark this peer as a preferred download peer.
         {
         LOCK(cs_main);
@@ -5407,7 +5397,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 		
 		// Relay sync-checkpoint
 		{
-            LOCK(cs_hashSyncCheckpoint);
+            LOCK(cs_main);
             if (!checkpointMessage.IsNull())
                 checkpointMessage.RelayTo(pfrom);
         }
@@ -5433,9 +5423,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         int64_t nTimeOffset = nTime - GetTime();
         pfrom->nTimeOffset = nTimeOffset;
         AddTimeData(pfrom->addr, nTimeOffset);
-
-        if (!IsInitialBlockDownload())
-            AskForPendingSyncCheckpoint(pfrom);
     }
 
 
@@ -6545,7 +6532,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         CSyncCheckpoint checkpoint;
         vRecv >> checkpoint;
-        if (checkpoint.ProcessSyncCheckpoint(pfrom))
+        if (checkpoint.ProcessSyncCheckpoint())
         {
             // Relay
             pfrom->hashCheckpointKnown = checkpoint.hashCheckpoint;
